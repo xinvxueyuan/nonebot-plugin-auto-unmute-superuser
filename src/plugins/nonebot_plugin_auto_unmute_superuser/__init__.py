@@ -3,6 +3,12 @@
 监听 OneBot V11 群禁言事件：当 NoneBot 全局 ``SUPERUSERS`` 中的用户在
 启用范围内被禁言时，自动调用 ``set_group_ban(duration=0)`` 解禁。
 
+**双通道保障**：
+    1. **事件驱动**（即时）：监听 ``GroupBanNoticeEvent``，禁言发生瞬间解禁。
+    2. **周期轮询**（兜底）：apscheduler 定时任务周期性调用
+       ``get_group_member_list``，发现保护对象处于禁言状态（遗漏事件、
+       bot 掉线期间被禁言等场景）即恢复。
+
 设计动机（操作后恢复保护）：
     lingchu-bot 的 protect_member 是**操作前白名单拦截**，只挡人工命令；
     bot 自身 API 调用（如 poke 戳一戳插件的惩罚逻辑）直接
@@ -12,19 +18,28 @@
     - ``block=False``：OCR 插件的 ``on_group_ban`` 同样监听本事件用于
       验证会话禁言状态同步，不能被拦截。
     - 超管判定使用 NoneBot 全局 ``SUPERUSERS``（非任何插件私有配置）。
+    - 轮询与事件驱动对同一禁言可能各解禁一次：``set_group_ban(duration=0)``
+      幂等，无副作用。
 """
 
 from __future__ import annotations
 
-from nonebot import get_driver, logger, on_notice
+from collections.abc import Mapping
+from time import time
+from typing import Any
+
+from nonebot import get_bots, get_driver, logger, on_notice, require
 from nonebot.adapters.onebot.v11 import Bot, GroupBanNoticeEvent
 from nonebot.plugin import PluginMetadata
+
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_apscheduler import scheduler
 
 from .config import plugin_config
 
 __plugin_meta__ = PluginMetadata(
     name="超管自动解禁",
-    description="超级用户在群内被禁言时自动解禁（操作后恢复保护）",
+    description="超级用户在群内被禁言时自动解禁（事件驱动 + 周期轮询兜底）",
     usage="自动运行，无需指令。被禁言的超级用户会自动解除禁言。",
     type="application",
     homepage="",
@@ -50,30 +65,130 @@ async def auto_unmute_superuser(
     """超级用户在启用范围内被禁言时自动解禁。"""
     if event.sub_type != "ban":
         return
-    user_id = str(event.user_id)
-    if user_id not in driver.config.superusers:
+    if not _is_protected_user(str(event.user_id)):
         return
+    if not _is_monitored_group(event.group_id):
+        return
+    await _unmute(bot, event.group_id, event.user_id, source="事件驱动")
+
+
+def _is_protected_user(user_id: str) -> bool:
+    """是否为 NoneBot 全局超级用户。"""
+    return user_id in driver.config.superusers
+
+
+def _is_monitored_group(group_id: int) -> bool:
+    """是否在启用范围内（配置为空 = 全部群）。"""
     groups = plugin_config.superuser_unmute_groups
-    if groups and event.group_id not in groups:
-        return
+    return not groups or group_id in groups
+
+
+async def _unmute(
+    bot: Bot,
+    group_id: int,
+    user_id: int,
+    *,
+    source: str,
+) -> None:
+    """解禁并记录日志；失败仅记日志不抛出。"""
     try:
         await bot.set_group_ban(
-            group_id=event.group_id,
-            user_id=event.user_id,
+            group_id=group_id,
+            user_id=user_id,
             duration=0,
         )
     except Exception:
         logger.exception(
-            "自动解禁超级用户失败 group=%s user=%s",
-            event.group_id,
-            event.user_id,
+            "自动解禁超级用户失败（%s） group=%s user=%s",
+            source,
+            group_id,
+            user_id,
         )
         return
     logger.info(
-        "超级用户 %s 在群 %s 被禁言，已自动解禁",
+        "超级用户 %s 在群 %s 被禁言，已自动解禁（%s）",
         user_id,
-        event.group_id,
+        group_id,
+        source,
     )
 
+
+def _member_is_muted(member: Mapping[str, Any]) -> bool:
+    """判断成员是否处于禁言中。
+
+    兼容不同 OneBot 实现：
+    - ``shut_up`` 布尔字段（部分实现）；
+    - ``shut_up_timestamp`` 禁言到期时间戳，兼容秒 / 毫秒单位。
+    """
+    if member.get("shut_up") is True:
+        return True
+    ts = member.get("shut_up_timestamp") or 0
+    if not ts:
+        return False
+    if ts > 1e11:  # 毫秒时间戳
+        ts /= 1000.0
+    return ts > time()
+
+
+async def _iter_scope_group_ids(bot: Bot) -> list[int]:
+    """确定轮询群范围：配置列表或（空配置时）bot 所在全部群。"""
+    groups = plugin_config.superuser_unmute_groups
+    if groups:
+        return list(groups)
+    try:
+        group_list = await bot.get_group_list()
+        return [int(g.get("group_id")) for g in group_list]
+    except Exception:
+        logger.exception("获取群列表失败，本轮跳过")
+        return []
+
+
+async def _poll_once(bot: Bot) -> None:
+    """单轮轮询：检测启用群内超管是否被禁言，是则恢复。"""
+    protected = set(driver.config.superusers)
+    if not protected:
+        return
+    for group_id in await _iter_scope_group_ids(bot):
+        try:
+            members = await bot.get_group_member_list(group_id=group_id)
+        except Exception:
+            logger.exception(
+                "轮询获取群 %s 成员列表失败，跳过该群",
+                group_id,
+            )
+            continue
+        for member in members:
+            user_id = int(member.get("user_id") or 0)
+            if str(user_id) not in protected:
+                continue
+            if _member_is_muted(member):
+                await _unmute(bot, group_id, user_id, source="周期轮询")
+
+
+async def _poll_and_restore() -> None:
+    """轮询入口：遍历当前所有 bot 执行一轮检测。"""
+    bots = get_bots()
+    if not bots:
+        return
+    for bot in bots.values():
+        if isinstance(bot, Bot):
+            await _poll_once(bot)
+
+
+if plugin_config.superuser_unmute_poll_enabled:
+    scheduler.add_job(
+        _poll_and_restore,
+        trigger="interval",
+        seconds=plugin_config.superuser_unmute_poll_interval,
+        id="auto_unmute_superuser_poll",
+        replace_existing=True,
+        misfire_grace_time=60,
+        coalesce=True,
+        max_instances=1,
+    )
+    logger.info(
+        "超管自动解禁轮询已启用：间隔 %s 秒",
+        plugin_config.superuser_unmute_poll_interval,
+    )
 
 __all__ = ["__plugin_meta__", "plugin_config"]
