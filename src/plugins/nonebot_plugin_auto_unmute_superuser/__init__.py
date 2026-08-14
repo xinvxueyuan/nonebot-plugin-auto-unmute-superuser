@@ -56,6 +56,8 @@ driver = get_driver()
 
 ban_notice = on_notice(priority=1, block=False)
 
+_first_round_done: dict[str, bool] = {"done": False}
+
 
 @ban_notice.handle()
 async def auto_unmute_superuser(
@@ -99,14 +101,14 @@ async def _unmute(
         )
     except Exception:
         logger.exception(
-            "自动解禁超级用户失败（%s） group=%s user=%s",
+            "自动解禁超级用户失败（{}） group={} user={}",
             source,
             group_id,
             user_id,
         )
         return
     logger.info(
-        "超级用户 %s 在群 %s 被禁言，已自动解禁（%s）",
+        "超级用户 {} 在群 {} 被禁言，已自动解禁（{}）",
         user_id,
         group_id,
         source,
@@ -142,7 +144,6 @@ async def _iter_scope_group_ids(bot: Bot) -> list[int]:
         logger.exception("获取群列表失败，本轮跳过")
         return []
 
-
 async def _poll_once(bot: Bot) -> None:
     """单轮轮询：检测启用群内超管是否被禁言，是则恢复。"""
     protected = set(driver.config.superusers)
@@ -153,7 +154,7 @@ async def _poll_once(bot: Bot) -> None:
             members = await bot.get_group_member_list(group_id=group_id)
         except Exception:
             logger.exception(
-                "轮询获取群 %s 成员列表失败，跳过该群",
+                "轮询获取群 {} 成员列表失败，跳过该群",
                 group_id,
             )
             continue
@@ -173,6 +174,12 @@ async def _poll_and_restore() -> None:
     for bot in bots.values():
         if isinstance(bot, Bot):
             await _poll_once(bot)
+    if not _first_round_done["done"]:
+        _first_round_done["done"] = True
+        logger.info(
+            "超管自动解禁轮询首轮完成：检查 {} 个 bot",
+            len(bots),
+        )
 
 
 if plugin_config.superuser_unmute_poll_enabled:
@@ -187,7 +194,7 @@ if plugin_config.superuser_unmute_poll_enabled:
         max_instances=1,
     )
     logger.info(
-        "超管自动解禁轮询已启用：间隔 %s 秒",
+        "超管自动解禁轮询已启用：间隔 {} 秒",
         plugin_config.superuser_unmute_poll_interval,
     )
 
