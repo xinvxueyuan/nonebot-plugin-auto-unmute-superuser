@@ -9,6 +9,14 @@
        ``get_group_member_list``，发现保护对象处于禁言状态（遗漏事件、
        bot 掉线期间被禁言等场景）即恢复。
 
+**权限感知（v0.2）**：QQ 协议规定管理员无法禁言/解禁同为管理员或群主的
+用户。每次禁言事件落库记录 operator（``storage.record_ban_event``），
+解禁前查询最近 operator 的角色：若操作者是**群主**（owner），说明这是
+群主主动决定（且 bot 通常无权操作该目标），**静默跳过**不再空转尝试；
+其他来源（bot 自身 API 如 poke 惩罚、管理员禁言普通成员）照常解禁。
+事件遗漏导致 DB 无记录时，按目标角色兜底判断（目标为 admin/owner 且
+bot 非 owner 则跳过）。
+
 设计动机（操作后恢复保护）：
     lingchu-bot 的 protect_member 是**操作前白名单拦截**，只挡人工命令；
     bot 自身 API 调用（如 poke 戳一戳插件的惩罚逻辑）直接
@@ -24,9 +32,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from time import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nonebot import get_bots, get_driver, logger, on_notice, require
 from nonebot.adapters.onebot.v11 import Bot, GroupBanNoticeEvent
@@ -36,6 +43,10 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
 
 from .config import plugin_config
+from .storage import latest_operator, prune_events, record_ban_event
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __plugin_meta__ = PluginMetadata(
     name="超管自动解禁",
@@ -71,6 +82,16 @@ async def auto_unmute_superuser(
         return
     if not _is_monitored_group(event.group_id):
         return
+    # 事件落库：记录禁言操作者，供解禁决策查询。
+    record_ban_event(
+        group_id=event.group_id,
+        user_id=event.user_id,
+        operator_id=event.operator_id,
+        duration=event.duration,
+        banned_at=int(time()),
+    )
+    if await _should_skip_unmute(bot, event.group_id, event.user_id):
+        return
     await _unmute(bot, event.group_id, event.user_id, source="事件驱动")
 
 
@@ -83,6 +104,65 @@ def _is_monitored_group(group_id: int) -> bool:
     """是否在启用范围内（配置为空 = 全部群）。"""
     groups = plugin_config.superuser_unmute_groups
     return not groups or group_id in groups
+
+
+async def _should_skip_unmute(bot: Bot, group_id: int, user_id: int) -> bool:
+    """判断是否应跳过自动解禁（权限不足 / 群主主动禁言）。
+
+    优先级：
+    1. 事件库有记录 → 查 operator 角色：群主（owner）→ 跳过；
+       其他角色 → 可解禁。
+    2. 事件库无记录（事件遗漏）→ 目标角色为 admin/owner 且 bot 非
+       owner → 跳过（bot 无权限）；否则尝试解禁。
+
+    返回 True 表示应跳过（静默，不尝试、不通知）。
+    """
+    operator_id = latest_operator(group_id=group_id, user_id=user_id)
+    if operator_id is not None:
+        operator_role = await _member_role(bot, group_id, operator_id)
+        if operator_role == "owner":
+            logger.info(
+                "超级用户 {} 在群 {} 被群主禁言，尊重群主决定，跳过自动解禁",
+                user_id,
+                group_id,
+            )
+            return True
+        return False
+
+    # 事件遗漏兜底：按目标角色判断。
+    target_role = await _member_role(bot, group_id, user_id)
+    if target_role not in ("admin", "owner"):
+        return False
+    bot_role = await _member_role(bot, group_id, int(bot.self_id))
+    if bot_role == "owner":
+        return False
+    logger.info(
+        "超级用户 {} 在群 {} 被禁言但目标为 {}，bot 角色为 {}，无权限解禁，跳过",
+        user_id,
+        group_id,
+        target_role,
+        bot_role,
+    )
+    return True
+
+
+async def _member_role(bot: Bot, group_id: int, user_id: int) -> str | None:
+    """查询成员角色（owner/admin/member）；失败返回 None。"""
+    try:
+        info = await bot.get_group_member_info(
+            group_id=group_id,
+            user_id=user_id,
+            no_cache=True,
+        )
+        role = info.get("role")
+        return str(role) if role else None
+    except Exception:
+        logger.exception(
+            "查询成员角色失败 group={} user={}",
+            group_id,
+            user_id,
+        )
+        return None
 
 
 async def _unmute(
@@ -139,10 +219,11 @@ async def _iter_scope_group_ids(bot: Bot) -> list[int]:
         return list(groups)
     try:
         group_list = await bot.get_group_list()
-        return [int(g.get("group_id")) for g in group_list]
+        return [int(g["group_id"]) for g in group_list]
     except Exception:
         logger.exception("获取群列表失败，本轮跳过")
         return []
+
 
 async def _poll_once(bot: Bot) -> None:
     """单轮轮询：检测启用群内超管是否被禁言，是则恢复。"""
@@ -163,6 +244,8 @@ async def _poll_once(bot: Bot) -> None:
             if str(user_id) not in protected:
                 continue
             if _member_is_muted(member):
+                if await _should_skip_unmute(bot, group_id, user_id):
+                    continue
                 await _unmute(bot, group_id, user_id, source="周期轮询")
 
 
@@ -174,6 +257,7 @@ async def _poll_and_restore() -> None:
     for bot in bots.values():
         if isinstance(bot, Bot):
             await _poll_once(bot)
+    prune_events()
     if not _first_round_done["done"]:
         _first_round_done["done"] = True
         logger.info(
