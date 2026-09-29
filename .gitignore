@@ -26,3 +26,9 @@ data/
 Thumbs.db
 .idea/
 .vscode/
+
+# 测试产物（YOLO 布局检测输出）
+imgs/
+
+# 测试产物（YOLO 布局检测输出）
+layout_det_res_0.jpg
