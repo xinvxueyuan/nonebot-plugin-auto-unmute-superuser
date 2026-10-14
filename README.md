@@ -49,9 +49,15 @@ git -C vendor/nonebot-plugin-auto-unmute-superuser checkout <钉定 SHA>
 ```bash
 uv run ruff check . && uv run ruff format --check .
 uv run pyright
+uv run python scripts/verify_storage.py   # storage 纯逻辑验证（3 个场景）
 ```
 
-（本仓暂无 `tests/`；`scripts/verify_storage.py` 是 storage 纯逻辑验证脚本，但其 mock 的 `nonebot` 未覆盖包入口所需符号（`get_bots` 等）—— 直接运行会 `ImportError`，`ruff check` 亦在该脚本上报错。）
+- 本仓暂无 `tests/`；`scripts/verify_storage.py` 覆盖 storage 的记录 / 查询最近 operator /
+  `prune_events` 三条纯逻辑：它**按路径直接加载 `storage.py`**（不 import 插件包），
+  只 mock 该模块真正用到的 `nonebot.logger` / `require` 与 localstore 数据目录 ——
+  2026-10-14 修过一次「包入口加了 `get_bots`，脚本 ImportError 变死文件」。
+- ⚠️ 若 `uv run pyright` 只打 `Please install the new version` 而不检查（包装器版本漂移），
+  用 `PYRIGHT_PYTHON_FORCE_VERSION=latest uv run pyright`（实测 0 errors）。
 
 ## 为什么需要它
 
