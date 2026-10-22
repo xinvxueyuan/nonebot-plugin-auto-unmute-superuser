@@ -97,7 +97,7 @@ uv run python scripts/verify_storage.py   # storage 纯逻辑验证（3 个场�
 
 ## 许可证与相关仓库
 
-MIT —— `pyproject.toml` 的 `license` 字段声明 MIT；**仓库未附 `LICENSE` 文件**，以 `pyproject.toml` 为准。
+MIT —— 全文见 [`LICENSE`](LICENSE)；`pyproject.toml` 的 `license` 字段同为 MIT。
 
 - 宿主仓库：[xinvxueyuan/qbot](https://github.com/xinvxueyuan/qbot)（以 git 子模块挂在 `vendor/nonebot-plugin-auto-unmute-superuser`）
 - [xinvxueyuan/lingchu-bot](https://github.com/xinvxueyuan/lingchu-bot)：`protect_member` 做**操作前**白名单拦截，本插件做**操作后**恢复，两者互补
