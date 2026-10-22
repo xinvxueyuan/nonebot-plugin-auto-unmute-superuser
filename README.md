@@ -2,7 +2,12 @@
 
 超级用户（NoneBot 全局 `SUPERUSERS`）在群内被禁言时**自动解禁**的 NoneBot2 插件：群禁言事件即时恢复 + apscheduler 周期轮询兜底，为「操作前白名单拦截」补上**操作后恢复**。
 
-## 功能
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-MIT-blue)](pyproject.toml)
+
+> **qbot 插件** · 宿主仓库：[xinvxueyuan/qbot](https://github.com/xinvxueyuan/qbot)
+
+## 功能特性
 
 - **自动运行、无命令**：插件没有任何用户指令；靠下面两条通道触发解禁。
 - **事件驱动（即时）**：监听 `GroupBanNoticeEvent` 的 `ban` 子事件，超管在启用范围内被禁言的瞬间调用 `set_group_ban(duration=0)` 解禁（`block=False`，不拦截事件 —— OCR 插件的会话禁言状态同步等监听不受影响）。
@@ -11,6 +16,32 @@
 - **超管判定**：使用 NoneBot 全局 `SUPERUSERS`（`get_driver().config.superusers`），无插件私有名单；启用范围由 `SUPERUSER_UNMUTE_GROUPS` 控制（留空 = 全部群）。
 - **失败只记日志**：解禁调用失败（如 bot 无群管理权限）记异常日志、不抛出，不影响其他处理；事件库每对 (群, 用户) 只保留最近 5 条（轮询时清理）。
 - **生产现状**：本插件在 qbot 生产里**已停用**（2026-10-02 起，qbot `pyproject.toml` 的 `plugin_dirs` 中注释掉）—— 超管抽奖后 1 秒就被它解禁，抽奖对超管失效；子模块仍在（钉定版本），恢复 = 取消注释并重启。
+
+### 为什么需要它
+
+lingchu-bot 的 `protect_member` 是**操作前白名单拦截**——只挡人工命令（禁言/踢出等）。
+但 bot 自身 API 调用（如 poke 戳一戳插件的惩罚逻辑直接 `set_group_ban`）白名单拦不住。
+本插件是**操作后恢复**：监听群禁言事件，若被禁言者是超级用户则立即解禁，两者互补。
+
+## 安装
+
+### 依赖
+
+- 运行依赖（以 `pyproject.toml` 的 `dependencies` 为准）：`nonebot2 >= 2.5.0`、`nonebot-adapter-onebot >= 2.4.6`（OneBot V11 适配器）、`nonebot-plugin-apscheduler >= 0.5.0`（轮询调度）、`nonebot-plugin-localstore >= 0.7.4`（禁言事件库的数据目录）
+- Python：`>= 3.10`
+
+### 接入宿主
+
+- 安装（宿主以 git 子模块引入）：
+
+```bash
+git submodule add -b main https://github.com/xinvxueyuan/nonebot-plugin-auto-unmute-superuser.git \
+  vendor/nonebot-plugin-auto-unmute-superuser
+git -C vendor/nonebot-plugin-auto-unmute-superuser checkout <钉定 SHA>
+```
+
+- 宿主 `[tool.nonebot] plugin_dirs` 加一行 `vendor/nonebot-plugin-auto-unmute-superuser/src/plugins`（仓库实际布局 `src/plugins/nonebot_plugin_auto_unmute_superuser`）
+- 也可直接放进 zhenxun（或任意 NoneBot2 项目）的 `plugins/` 目录；本仓自带 `[tool.nonebot] plugin_dirs = ["src/plugins"]` 供独立开发
 
 ## 配置
 
@@ -29,22 +60,19 @@ SUPERUSER_UNMUTE_POLL_INTERVAL=120
 
 超管判定使用 NoneBot 全局 `SUPERUSERS`（`get_driver().config.superusers`），无需额外配置。
 
-## 依赖与安装
+## 使用 / 命令
 
-- 运行依赖（以 `pyproject.toml` 的 `dependencies` 为准）：`nonebot2 >= 2.5.0`、`nonebot-adapter-onebot >= 2.4.6`（OneBot V11 适配器）、`nonebot-plugin-apscheduler >= 0.5.0`（轮询调度）、`nonebot-plugin-localstore >= 0.7.4`（禁言事件库的数据目录）
-- Python：`>= 3.10`
-- 安装（宿主以 git 子模块引入）：
+**本插件不注册任何命令**：加载即生效（`__plugin_meta__.usage` 写的就是「自动运行，无需指令」），
+没有命令词、没有别名、也不需要 @bot。
 
-```bash
-git submodule add -b main https://github.com/xinvxueyuan/nonebot-plugin-auto-unmute-superuser.git \
-  vendor/nonebot-plugin-auto-unmute-superuser
-git -C vendor/nonebot-plugin-auto-unmute-superuser checkout <钉定 SHA>
-```
+- **生效范围**：`SUPERUSER_UNMUTE_GROUPS`（留空 = 所有群生效）；保护对象固定为 NoneBot 全局 `SUPERUSERS`，插件没有私有名单。
+- **两条通道**：即时通道挂在 `on_notice(priority=1, block=False)` 的群禁言事件上；兜底通道是 apscheduler 任务 `auto_unmute_superuser_poll`（`misfire_grace_time=60`、`coalesce=True`、`max_instances=1`）。
+- **确认在跑**：启动后在日志里能看到这两行（关掉轮询时不会打，只剩事件通道）：
+  - `超管自动解禁轮询已启用：间隔 60 秒`
+  - `超管自动解禁轮询首轮完成：检查 N 个 bot`
+- **手动验一次**：让一个在 `SUPERUSERS` 里的号在启用范围内被禁言 —— 事件通道当场解禁；直接禁言后等一个轮询周期，兜底通道也会解禁。
 
-- 宿主 `[tool.nonebot] plugin_dirs` 加一行 `vendor/nonebot-plugin-auto-unmute-superuser/src/plugins`（仓库实际布局 `src/plugins/nonebot_plugin_auto_unmute_superuser`）
-- 也可直接放进 zhenxun（或任意 NoneBot2 项目）的 `plugins/` 目录；本仓自带 `[tool.nonebot] plugin_dirs = ["src/plugins"]` 供独立开发
-
-## 测试与门禁
+## 开发与测试
 
 ```bash
 uv run ruff check . && uv run ruff format --check .
@@ -58,18 +86,20 @@ uv run python scripts/verify_storage.py   # storage 纯逻辑验证（3 个场�
   2026-10-14 修过一次「包入口加了 `get_bots`，脚本 ImportError 变死文件」。
 - ⚠️ 若 `uv run pyright` 只打 `Please install the new version` 而不检查（包装器版本漂移），
   用 `PYRIGHT_PYTHON_FORCE_VERSION=latest uv run pyright`（实测 0 errors）。
+- 门禁配置都在 `pyproject.toml`：`ruff`（`line-length = 88`、`target-version = "py310"`、30 组规则）
+  与 `pyright` `strict`（`include = ["src"]`，只放行 unknown 类型系列报告）；dev 依赖走
+  `[dependency-groups]` 的 `dev` → `lint`（`ruff`、`pyright`）。
 
-## 为什么需要它
-
-lingchu-bot 的 `protect_member` 是**操作前白名单拦截**——只挡人工命令（禁言/踢出等）。
-但 bot 自身 API 调用（如 poke 戳一戳插件的惩罚逻辑直接 `set_group_ban`）白名单拦不住。
-本插件是**操作后恢复**：监听群禁言事件，若被禁言者是超级用户则立即解禁，两者互补。
-
-## 设计来源
+### 设计来源
 
 从 ocr-fanqie-novel v0.1.1 剥离（commit `8228d36`「剥离超级用户保护，交由外部 bot 处理」），
 独立成插件部署。
 
-## 许可
+## 许可证与相关仓库
 
-MIT（见 `pyproject.toml` 的 `license` 字段；仓库暂未附 `LICENSE` 文件）。
+MIT —— `pyproject.toml` 的 `license` 字段声明 MIT；**仓库未附 `LICENSE` 文件**，以 `pyproject.toml` 为准。
+
+- 宿主仓库：[xinvxueyuan/qbot](https://github.com/xinvxueyuan/qbot)（以 git 子模块挂在 `vendor/nonebot-plugin-auto-unmute-superuser`）
+- [xinvxueyuan/lingchu-bot](https://github.com/xinvxueyuan/lingchu-bot)：`protect_member` 做**操作前**白名单拦截，本插件做**操作后**恢复，两者互补
+- 本插件没有其他硬联动：解禁只用到 OneBot V11 的 `set_group_ban` / `get_group_member_list`，
+  禁言事件库落在 `nonebot-plugin-localstore` 给的数据目录里。
